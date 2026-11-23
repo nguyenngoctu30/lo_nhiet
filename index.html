@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Giám Sát & Điều Khiển Lò Nhiệt GA-PID (HiveMQ)</title>
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', Arial, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      margin: 0;
+      padding: 18px;
+    }
+    .wrap { max-width: 980px; margin: auto; }
+    .header {
+      display: flex; justify-content: space-between; align-items: center;
+      flex-wrap: wrap; gap: 10px; margin-bottom: 16px;
+    }
+    h2 { margin: 0; color: #38bdf8; font-size: 22px; }
+    .badge {
+      padding: 6px 12px; border-radius: 999px; font-size: 13px; font-weight: bold;
+      background: #334155; color: #f8fafc;
+    }
+    .badge.ok { background: #166534; color: #bbf7d0; }
+    .badge.err { background: #991b1b; color: #fecaca; }
+    .grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 12px; margin-bottom: 14px;
+    }
+    .card {
+      background: #1e293b; border: 1px solid #334155; border-radius: 12px;
+      padding: 14px; text-align: center; box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    }
+    .lbl { font-size: 12px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; }
+    .val { font-size: 25px; font-weight: bold; margin-top: 6px; color: #f8fafc; }
+    .on { color: #22c55e; }
+    .off { color: #ef4444; }
+    .accent { color: #38bdf8; }
+    .warn { color: #facc15; }
+    .box {
+      background: #1e293b; border: 1px solid #334155; border-radius: 12px;
+      padding: 16px; margin-bottom: 14px;
+    }
+    .chart-wrap { position: relative; height: 280px; width: 100%; }
+    .ctrl-row {
+      display: flex; gap: 10px; align-items: center; justify-content: center; flex-wrap: wrap;
+    }
+    input[type="number"] {
+      padding: 10px 14px; border-radius: 8px; border: 1px solid #475569;
+      background: #0f172a; color: #fff; width: 120px; font-size: 16px; font-weight: bold;
+    }
+    button {
+      padding: 10px 16px; border-radius: 8px; border: none;
+      background: #0284c7; color: #fff; font-weight: bold; cursor: pointer; font-size: 14px;
+      transition: 0.15s;
+    }
+    button:hover { background: #0369a1; }
+    button.preset { background: #334155; }
+    button.preset:hover { background: #475569; }
+    button.danger { background: #b91c1c; }
+    button.danger:hover { background: #991b1b; }
+    .topic-info { font-size: 12px; color: #64748b; text-align: center; margin-top: 8px; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="header">
+    <h2>🔥 ĐIỀU KHIỂN LÒ NHIỆT GA-PID (HIVEMQ)</h2>
+    <div id="mqttStatus" class="badge">⏳ Đang kết nối HiveMQ...</div>
+  </div>
+
+  <div class="grid">
+    <div class="card"><div class="lbl">Nhiệt độ thực (MAX6675)</div><div class="val accent" id="temp">-- °C</div></div>
+    <div class="card"><div class="lbl">Nhiệt độ đặt (Setpoint)</div><div class="val warn" id="sp">-- °C</div></div>
+    <div class="card"><div class="lbl">Relay Nồi (PB0)</div><div class="val" id="rel">--</div></div>
+    <div class="card"><div class="lbl">Quạt 12V (PB1)</div><div class="val" id="fan">--</div></div>
+    <div class="card"><div class="lbl">Ổn định hệ thống (GA)</div><div class="val" id="st">--</div></div>
+  </div>
+
+  <div class="box">
+    <div class="lbl" style="margin-bottom: 10px;">Đồ thị đáp ứng nhiệt độ theo thời gian thực (°C)</div>
+    <div class="chart-wrap">
+      <canvas id="tempChart"></canvas>
+    </div>
+  </div>
+
+  <div class="box">
+    <div class="ctrl-row">
+      <span><strong>Đặt nhiệt độ (20 – 150°C):</strong></span>
+      <input type="number" id="inSp" value="60" min="20" max="150" step="1">
+      <button onclick="sendSetpoint()">Gửi xuống STM32</button>
+      <button class="preset" onclick="quickSet(40)">40°C</button>
+      <button class="preset" onclick="quickSet(60)">60°C</button>
+      <button class="preset" onclick="quickSet(80)">80°C</button>
+      <button class="preset" onclick="quickSet(150)">150°C</button>
+      <button class="danger" onclick="clearChart()">Xóa đồ thị</button>
+    </div>
+    <div class="topic-info">
+      Broker: <code>broker.hivemq.com</code> | Sub: <code>lonhiet_gapid/data</code> | Pub: <code>lonhiet_gapid/setpoint</code>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card"><div class="lbl">Kp (GA tối ưu)</div><div class="val" id="kp">--</div></div>
+    <div class="card"><div class="lbl">Ki (GA tối ưu)</div><div class="val" id="ki">--</div></div>
+    <div class="card"><div class="lbl">Kd (GA tối ưu)</div><div class="val" id="kd">--</div></div>
+  </div>
+
+  <div class="grid">
+    <div class="card"><div class="lbl">Thời gian xác lập (t_xl)</div><div class="val" id="txl">--</div></div>
+    <div class="card"><div class="lbl">Độ vọt lố (POT)</div><div class="val" id="pot">--</div></div>
+    <div class="card"><div class="lbl">Sai số xác lập (e_xl)</div><div class="val" id="exl">--</div></div>
+  </div>
+</div>
+
+<script>
+  const BROKER_URL   = "wss://broker.hivemq.com:8884/mqtt";
+  const TOPIC_DATA   = "lonhiet_gapid/data";
+  const TOPIC_SP     = "lonhiet_gapid/setpoint";
+  const MAX_POINTS   = 80;
+
+  // Khoi tao do thi Chart.js
+  const ctx = document.getElementById("tempChart").getContext("2d");
+  const chart = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: [],
+      datasets: [
+        {
+          label: "Nhiệt độ thực (°C)",
+          data: [],
+          borderColor: "#38bdf8",
+          backgroundColor: "rgba(56, 189, 248, 0.12)",
+          borderWidth: 2.5,
+          fill: true,
+          tension: 0.25,
+          pointRadius: 1.5
+        },
+        {
+          label: "Nhiệt độ đặt (°C)",
+          data: [],
+          borderColor: "#facc15",
+          borderDash: [6, 6],
+          borderWidth: 2,
+          fill: false,
+          pointRadius: 0
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      scales: {
+        x: { ticks: { color: "#94a3b8", maxTicksLimit: 10 }, grid: { color: "#1e293b" } },
+        y: { beginAtZero: true, suggestedMax: 160, ticks: { color: "#94a3b8" }, grid: { color: "#334155" } }
+      },
+      plugins: { legend: { labels: { color: "#e2e8f0" } } }
+    }
+  });
+
+  // Ket noi HiveMQ qua WebSocket (thong thang voi port 1883 cua ESP32)
+  const statusEl = document.getElementById("mqttStatus");
+  const client = mqtt.connect(BROKER_URL, {
+    clientId: "Web_GA_PID_" + Math.random().toString(16).slice(2, 8),
+    clean: true,
+    reconnectPeriod: 2000
+  });
+
+  client.on("connect", () => {
+    statusEl.innerText = "✅ Đã kết nối HiveMQ";
+    statusEl.className = "badge ok";
+    client.subscribe(TOPIC_DATA);
+  });
+
+  client.on("reconnect", () => {
+    statusEl.innerText = "🔄 Đang kết nối lại...";
+    statusEl.className = "badge";
+  });
+
+  client.on("error", () => {
+    statusEl.innerText = "❌ Lỗi kết nối HiveMQ";
+    statusEl.className = "badge err";
+  });
+
+  client.on("message", (topic, payload) => {
+    if (topic !== TOPIC_DATA) return;
+    try {
+      const d = JSON.parse(payload.toString());
+      document.getElementById("temp").innerText = (d.temp >= 0 ? d.temp.toFixed(2) + " °C" : "LỖI ĐẦU DÒ");
+      document.getElementById("sp").innerText   = d.sp.toFixed(1) + " °C";
+
+      const relEl = document.getElementById("rel");
+      relEl.innerText = d.relay ? "ON" : "OFF";
+      relEl.className = "val " + (d.relay ? "on" : "off");
+
+      const fanEl = document.getElementById("fan");
+      fanEl.innerText = d.fan ? "ON" : "OFF";
+      fanEl.className = "val " + (d.fan ? "accent" : "off");
+
+      const stEl = document.getElementById("st");
+      stEl.innerText = d.stable ? "ỔN ĐỊNH" : "MẤT ỔN ĐỊNH";
+      stEl.className = "val " + (d.stable ? "on" : "off");
+
+      document.getElementById("kp").innerText  = d.kp.toFixed(2);
+      document.getElementById("ki").innerText  = d.ki.toFixed(2);
+      document.getElementById("kd").innerText  = d.kd.toFixed(2);
+      document.getElementById("txl").innerText = d.t_xl.toFixed(4) + " s";
+      document.getElementById("pot").innerText = d.pot.toFixed(3) + " %";
+      document.getElementById("exl").innerText = d.e_xl.toFixed(4);
+
+      if (d.temp > 0) {
+        const nowStr = new Date().toLocaleTimeString("vi-VN", { hour12: false });
+        chart.data.labels.push(nowStr);
+        chart.data.datasets[0].data.push(d.temp);
+        chart.data.datasets[1].data.push(d.sp);
+        if (chart.data.labels.length > MAX_POINTS) {
+          chart.data.labels.shift();
+          chart.data.datasets[0].data.shift();
+          chart.data.datasets[1].data.shift();
+        }
+        chart.update("none");
+      }
+    } catch (e) {
+      console.error("Loi doc JSON:", e);
+    }
+  });
+
+  function sendSetpoint() {
+    const val = parseFloat(document.getElementById("inSp").value);
+    if (isNaN(val) || val < 20 || val > 150) {
+      alert("Vui lòng nhập nhiệt độ từ 20 đến 150 °C!");
+      return;
+    }
+    client.publish(TOPIC_SP, val.toString());
+  }
+
+  function quickSet(val) {
+    document.getElementById("inSp").value = val;
+    sendSetpoint();
+  }
+
+  function clearChart() {
+    chart.data.labels = [];
+    chart.data.datasets[0].data = [];
+    chart.data.datasets[1].data = [];
+    chart.update();
+  }
+</script>
+</body>
+</html>

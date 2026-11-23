@@ -1,0 +1,607 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include <string.h>
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+SPI_HandleTypeDef hspi1;
+
+UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart2;
+
+/* USER CODE BEGIN PV */
+volatile float temp_c = 0.0f;
+volatile uint16_t raw_data = 0;
+uint8_t spi_rx[2] = {0};
+
+// Bo thong so GA tu Python/MATLAB (tu dong ghi de khi Python gui qua USART1)
+float ga_kp = 43.52f, ga_ki = 2.54f, ga_kd = 149.34f;
+float ga_txl = 0.0654f, ga_pot = 0.000f, ga_exl = 0.0f;
+int   ga_stable = 1;
+
+// ---- THONG SO CHUAN CHO NOI 700W - 1.7KG NHOM (KHOP 100% VOI GA_PID.PY) ----
+#define TS_S           0.5f     // Chu ky lay mau & tinh PID (giay)
+#define PID_WINDOW_MS  3000u    // Cua so PWM relay 3 giay -> phan ung nhanh, it dao dong
+#define MIN_ON_MS      250.0f   // Xung bat toi thieu 250ms de ben tiep diem relay
+#define ABS_MAX_TEMP   102.0f   // Tran an toan tuyet doi (tranh nhay ro-le co cua noi)
+
+const float P_SCALE      = 0.12f;  // Keo nhanh khi hut dich
+const float I_SCALE      = 0.16f;  // Bu nhiet nhanh khi co gio quat
+const float D_SCALE      = 0.18f;  // Phanh muot khi nhiet tang
+const float I_MAX_OUT    = 40.0f;  // Du luc day len 90-95 do C khong bi dung hinh
+const float FF_GAIN      = 0.25f;  // Bu nhiet nen theo Setpoint (60C->7.5%, 80C->12.5%, 90C->15%)
+const float COAST_TIME_S = 14.0f;  // Phanh du bao quan tinh nhiet (giay)
+
+float setpoint       = 40.0f;
+float pid_out        = 0.0f;       // 0..100 %
+float pid_i          = 0.0f;       // Thanh phan I (don vi %)
+float temp_filt      = 0.0f;
+float prev_temp_filt = 0.0f;
+float rate_filt      = 0.0f;       // Toc do tang nhiet da loc (do C/s)
+
+uint8_t  relay_state         = 0;  // Trang thai Relay noi (PB0)
+uint8_t  fan_state           = 0;  // Trang thai Quat 12V (PB1)
+uint32_t window_start_tick   = 0;
+uint32_t window_on_time      = 0;
+float    on_residual         = 0.0f;
+uint8_t  force_window_update = 1;
+
+// Bo dem nhan ngat USART1 (goi GA tu PC/Python)
+uint8_t  rx1_byte;
+char     rx1_buf[128];
+char     rx1_line[128];
+uint16_t rx1_idx = 0;
+volatile uint8_t ga_packet_ready = 0;
+
+// Bo dem nhan ngat USART2 (lenh SP tu ESP32/Web)
+uint8_t  rx2_byte;
+char     rx2_buf[64];
+char     rx2_line[64];
+uint16_t rx2_idx = 0;
+volatile uint8_t sp_packet_ready = 0;
+
+uint32_t last_temp_tick = 0;
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_USART1_UART_Init(void);
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+// Chot cua so PWM 3s co cong don phan du (on_residual) -> giu nhiet sat dich khong bi vung chet
+static void latch_window(void)
+{
+    window_start_tick = HAL_GetTick();
+    if (pid_out <= 0.1f || temp_c >= setpoint) {
+        window_on_time = 0;
+        on_residual = 0.0f;
+        return;
+    }
+
+    float want = pid_out * 0.01f * (float)PID_WINDOW_MS + on_residual;
+    if (want < MIN_ON_MS) {
+        window_on_time = 0;
+        on_residual = want;
+    } else if (want >= (float)PID_WINDOW_MS - MIN_ON_MS) {
+        window_on_time = PID_WINDOW_MS;
+        on_residual = 0.0f;
+    } else {
+        window_on_time = (uint32_t)want;
+        on_residual = want - (float)window_on_time;
+    }
+}
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_SPI1_Init();
+  MX_USART2_UART_Init();
+  MX_USART1_UART_Init();
+  /* USER CODE BEGIN 2 */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET); // Keo CS len cao cho MAX6675 bat dau do
+  HAL_Delay(500);
+  HAL_UART_Receive_IT(&huart1, &rx1_byte, 1);         // Bat ngat nhan PC (USART1)
+  HAL_UART_Receive_IT(&huart2, &rx2_byte, 1);         // Bat ngat nhan ESP32/Web (USART2)
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+    // 1. Xu ly goi GA tu Python (USART1)
+    if (ga_packet_ready) {
+        ga_packet_ready = 0;
+        float kp, ki, kd, txl, pot, exl;
+        int st;
+        if (sscanf(rx1_line, "GA,%f,%f,%f,%f,%f,%f,%d",
+                   &kp, &ki, &kd, &txl, &pot, &exl, &st) == 7) {
+            ga_kp = kp; ga_ki = ki; ga_kd = kd;
+            ga_txl = txl; ga_pot = pot; ga_exl = exl; ga_stable = st;
+            pid_i = 0.0f;
+            on_residual = 0.0f;
+            force_window_update = 1;
+            char ack[128];
+            int len = snprintf(ack, sizeof(ack),
+                "STM32_OK: Kp=%.2f Ki=%.2f Kd=%.2f t_xl=%.4f POT=%.3f e_xl=%.4f St=%d\r\n",
+                ga_kp, ga_ki, ga_kd, ga_txl, ga_pot, ga_exl, ga_stable);
+            HAL_UART_Transmit(&huart1, (uint8_t*)ack, len, 100);
+        }
+    }
+
+    // 2. Xu ly lenh dat nhiet do (Setpoint) tu ESP32/Web (USART2)
+    if (sp_packet_ready) {
+        sp_packet_ready = 0;
+        float new_sp = 0.0f;
+        if (sscanf(rx2_line, "SP,%f", &new_sp) == 1) {
+            if (new_sp >= 20.0f && new_sp <= 100.0f) {
+                if (new_sp > setpoint + 5.0f || new_sp < setpoint - 5.0f) {
+                    pid_i = 0.0f;
+                }
+                setpoint = new_sp;
+                on_residual = 0.0f;
+                force_window_update = 1;
+            }
+        }
+    }
+
+    // 3. Doc MAX6675 + Tinh PID + Day du lieu len ESP32 moi 500ms
+    if (HAL_GetTick() - last_temp_tick >= 500) {
+        last_temp_tick = HAL_GetTick();
+
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+        HAL_SPI_Receive(&hspi1, spi_rx, 2, 100);
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+        raw_data = ((uint16_t)spi_rx[0] << 8) | spi_rx[1];
+
+        if (raw_data & 0x0004) {
+            temp_c = -1.0f;
+            pid_out = 0.0f;
+        } else {
+            temp_c = ((raw_data >> 3) & 0x0FFF) * 0.25f;
+
+            // Loc muot nhiet do de triet gai 0.25 do C truoc khi tinh toc do tang nhiet
+            if (temp_filt <= 0.0f) {
+                temp_filt = temp_c;
+                prev_temp_filt = temp_c;
+            }
+            temp_filt = 0.60f * temp_filt + 0.40f * temp_c;
+            float raw_rate = (temp_filt - prev_temp_filt) / TS_S;
+            prev_temp_filt = temp_filt;
+            rate_filt = 0.65f * rate_filt + 0.35f * raw_rate;
+
+            float err = setpoint - temp_c;
+
+            if (err <= 0.0f) {
+                // DA CHAM HOAC VUOT DICH -> CAT DIEN NGAY, NHUNG GIU LAI LUC NEN KHAU I!
+                pid_out = 0.0f;
+                on_residual = 0.0f;
+                if (err < -1.0f) {
+                    pid_i *= 0.95f;
+                    if (pid_i < 0.0f) pid_i = 0.0f;
+                }
+            } else if (err > 25.0f) {
+                // CON XA DICH (> 25 do) -> DOT KHOE 75% LEN NHANH MA KHONG TAO BOM NHIET
+                pid_out = 75.0f;
+                pid_i = 0.0f;
+            } else {
+                // VAO VUNG CAN DICH -> GA-PID + BU NHIET NEN (CHUAN MOI MUC 60 / 80 / 90 DO!)
+                float kp_eff = ga_kp * P_SCALE;
+                float ki_eff = ga_ki * I_SCALE;
+                float kd_eff = ga_kd * D_SCALE;
+
+                if (kp_eff < 2.0f)  kp_eff = 2.0f;
+                if (ki_eff < 0.10f) ki_eff = 0.10f;
+
+                // Mo vung tich phan len 12 do de keo len nhanh khi bi hut duoi SP
+                if (err < 12.0f && rate_filt < 0.20f) {
+                    pid_i += ki_eff * err * TS_S;
+                    if (pid_i > I_MAX_OUT) pid_i = I_MAX_OUT;
+                }
+
+                // Bu nhiet nen theo Setpoint
+                float u_ff = FF_GAIN * (setpoint - 30.0f);
+                if (u_ff < 0.0f) u_ff = 0.0f;
+
+                float p_term = kp_eff * err;
+
+                // Khau D: phanh manh khi tang, do nhe (+10%) khi tut nhiet
+                float d_term = -kd_eff * rate_filt;
+                if (d_term > 10.0f)  d_term = 10.0f;
+                if (d_term < -60.0f) d_term = -60.0f;
+
+                pid_out = u_ff + p_term + pid_i + d_term;
+
+                // Phanh du bao quan tinh -> cat dien som giu vot lo nho
+                float rate_pos = (rate_filt > 0.0f) ? rate_filt : 0.0f;
+                float temp_pred = temp_c + COAST_TIME_S * rate_pos;
+                if (temp_pred >= (setpoint - 0.3f) && rate_pos > 0.10f) {
+                    pid_out = 0.0f;
+                }
+
+                // Tran cong suat thong minh: dung hinh duoi dich -> mo ga 70% keo len ngay!
+                float max_duty = (err > 3.0f && rate_filt < 0.15f) ? 70.0f : 45.0f;
+                if (pid_out > max_duty) pid_out = max_duty;
+                if (pid_out < 0.0f)     pid_out = 0.0f;
+            }
+        }
+
+        if (force_window_update) {
+            force_window_update = 0;
+            latch_window();
+        }
+
+        // Day du lieu len ESP32 -> HiveMQ -> Web (11 truong, kem trang thai Quat PB1)
+        char esp_buf[128];
+        int esp_len = snprintf(esp_buf, sizeof(esp_buf),
+            "DATA,%.2f,%.1f,%.2f,%.2f,%.2f,%.4f,%.3f,%.4f,%d,%d,%d\n",
+            temp_c, setpoint, ga_kp, ga_ki, ga_kd, ga_txl, ga_pot, ga_exl, ga_stable, relay_state, fan_state);
+        HAL_UART_Transmit(&huart2, (uint8_t*)esp_buf, esp_len, 100);
+    }
+
+    // 4. Chot cua so PWM moi 3 giay
+    uint32_t now = HAL_GetTick();
+    if (now - window_start_tick >= PID_WINDOW_MS) {
+        latch_window();
+    }
+
+    // 5. Dieu khien Relay noi (PB0): CAT NGAY LAP TUC KHI CHAM SETPOINT HOAC PHANH YEU CAU!
+    if (temp_c <= 0.0f || temp_c >= setpoint || temp_c > ABS_MAX_TEMP || pid_out <= 0.1f) {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
+        relay_state = 0;
+    } else if ((now - window_start_tick) < window_on_time) {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
+        relay_state = 1;
+    } else {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
+        relay_state = 0;
+    }
+
+    // 6. Dieu khien Quat 12V (PB1) tu dong theo Setpoint (co tre 0.25 do chong nhap nha relay)
+    if (temp_c <= 0.0f) {
+        fan_state = 0;
+    } else if (temp_c >= setpoint - 0.75f) {
+        fan_state = 1; // Cham gan dich (-0.75 do) hoac ha SP thap hon nhiet thuc -> BAT QUAT!
+    } else if (temp_c <= setpoint - 1.00f) {
+        fan_state = 0; // Nguoi ve duoi (SP - 1.00 do) -> TAT QUAT!
+    }
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, fan_state ? GPIO_PIN_SET : GPIO_PIN_RESET);
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+
+  /* USER CODE BEGIN SPI1_Init 0 */
+
+  /* USER CODE END SPI1_Init 0 */
+
+  /* USER CODE BEGIN SPI1_Init 1 */
+
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 10;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
+
+  /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_1, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : PA4 */
+  GPIO_InitStruct.Pin = GPIO_PIN_4;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PB0 PB1 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART1) {
+        if (rx1_byte == '\n' || rx1_byte == '\r') {
+            if (rx1_idx > 0) {
+                rx1_buf[rx1_idx] = '\0';
+                strcpy(rx1_line, rx1_buf);
+                rx1_idx = 0;
+                ga_packet_ready = 1;
+            }
+        } else {
+            if (rx1_idx < sizeof(rx1_buf) - 1) {
+                rx1_buf[rx1_idx++] = (char)rx1_byte;
+            } else {
+                rx1_idx = 0;
+            }
+        }
+        HAL_UART_Receive_IT(&huart1, &rx1_byte, 1);
+    } else if (huart->Instance == USART2) {
+        if (rx2_byte == '\n' || rx2_byte == '\r') {
+            if (rx2_idx > 0) {
+                rx2_buf[rx2_idx] = '\0';
+                strcpy(rx2_line, rx2_buf);
+                rx2_idx = 0;
+                sp_packet_ready = 1;
+            }
+        } else {
+            if (rx2_idx < sizeof(rx2_buf) - 1) {
+                rx2_buf[rx2_idx++] = (char)rx2_byte;
+            } else {
+                rx2_idx = 0;
+            }
+        }
+        HAL_UART_Receive_IT(&huart2, &rx2_byte, 1);
+    }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART1) {
+        HAL_UART_Receive_IT(&huart1, &rx1_byte, 1);
+    } else if (huart->Instance == USART2) {
+        HAL_UART_Receive_IT(&huart2, &rx2_byte, 1);
+    }
+}
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint8_t *line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */

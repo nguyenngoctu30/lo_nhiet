@@ -1,0 +1,5 @@
+const float P_SCALE      = 0.1f;  // 43.52 * 0.12 = 5.22 -> len nhiet khoe, khong ru bo
+const float I_SCALE      = 0.12f;  // 2.54 * 0.08 = 0.20 -> keo sat dich nhanh ma khong lo
+const float D_SCALE      = 0.18f;  // 149.34 * 0.15 = 22.4 -> phanh muot khi nhiet tang
+const float I_MAX_OUT    = 26.0f;  // Noi 700W chi can 8-20% cong suat de giu 60-90 do C
+const float COAST_TIME_S = 14.0f;   // Thoi gian troi quan tinh (s): vot lo -> tang 8..10; cham -> giam 3..4
